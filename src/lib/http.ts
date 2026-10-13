@@ -46,14 +46,30 @@ const computeDelay = (attempt: number): number =>
     config.retry.maxDelayMs
   );
 
-const delay = (ms: number): Promise<void> =>
+export const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
 // Spacing for retries after a Google RPC rejection. Rejections come back in
 // ~100ms and requests sent in quick succession are rejected far more often,
 // so wait a flat 1.5-3s (with jitter) rather than starting with a short backoff.
-export const googleRetryDelay = (): Promise<void> =>
-  delay(config.retry.googleRetryMinDelayMs + Math.random() * config.retry.googleRetryMinDelayMs);
+export const googleRetryDelayMs = (): number =>
+  config.retry.googleRetryMinDelayMs + Math.random() * config.retry.googleRetryMinDelayMs;
+
+// --- Deadlines ---
+// A deadline is an absolute epoch-ms time after which a search must stop.
+// MCP clients cancel tool calls after a fixed time (often 60s), so long
+// searches must finish — or return what they have — before that.
+export type Deadline = number | undefined;
+
+export const TIME_LIMIT_ERROR = "Search time limit reached";
+
+export const timeLeft = (deadline: Deadline): number =>
+  deadline === undefined ? Number.POSITIVE_INFINITY : deadline - Date.now();
+
+export const isTimeLimitError = (error: string): boolean => error.startsWith(TIME_LIMIT_ERROR);
+
+const deadlineSignal = (deadline: Deadline): AbortSignal | undefined =>
+  deadline === undefined ? undefined : AbortSignal.timeout(Math.max(1, Math.floor(timeLeft(deadline))));
 
 // Parse a Retry-After header value. The header may be either:
 //   - a non-negative integer number of seconds
@@ -69,17 +85,20 @@ const parseRetryAfter = (raw: string | string[] | null | undefined): number | nu
   return null;
 };
 
-// Single-attempt POST via undici with fetch fallback
+// Single-attempt POST via undici with fetch fallback. The request is aborted
+// when the deadline passes.
 const postOnce = async (
   url: string,
   body: string,
-  headers: Record<string, string>
+  headers: Record<string, string>,
+  deadline: Deadline
 ): Promise<{ readonly status: number; readonly text: string; readonly retryAfterMs: number | null }> => {
   try {
     const { statusCode, headers: responseHeaders, body: responseBody } = await request(url, {
       method: "POST",
       headers,
       body,
+      signal: deadlineSignal(deadline),
     });
     return {
       status: statusCode,
@@ -87,10 +106,11 @@ const postOnce = async (
       retryAfterMs: parseRetryAfter(responseHeaders["retry-after"]),
     };
   } catch (undiciErr) {
+    if (timeLeft(deadline) <= 0) throw undiciErr;
     logger.warn("undici_failed_fallback_to_fetch", {
       error: undiciErr instanceof Error ? undiciErr.message : String(undiciErr),
     });
-    const response = await fetch(url, { method: "POST", headers, body });
+    const response = await fetch(url, { method: "POST", headers, body, signal: deadlineSignal(deadline) });
     return {
       status: response.status,
       text: await response.text(),
@@ -99,22 +119,25 @@ const postOnce = async (
   }
 };
 
-// Recursive retry with exponential backoff (or Retry-After when provided)
+// Recursive retry with exponential backoff (or Retry-After when provided).
+// Never waits or retries past the deadline.
 const postWithRetry = async (
   url: string,
   body: string,
   headers: Record<string, string>,
-  attempt: number
+  attempt: number,
+  deadline: Deadline
 ): Promise<Result<string>> => {
+  if (timeLeft(deadline) <= 0) return err(TIME_LIMIT_ERROR);
   try {
-    const { status, text, retryAfterMs } = await postOnce(url, body, headers);
+    const { status, text, retryAfterMs } = await postOnce(url, body, headers, deadline);
 
     if (status >= 200 && status < 300) return ok(text);
 
-    if (attempt < config.retry.maxRetries && RETRYABLE_STATUSES.has(status)) {
-      const waitMs = retryAfterMs !== null
-        ? Math.min(retryAfterMs, config.retry.maxDelayMs)
-        : computeDelay(attempt);
+    const waitMs = retryAfterMs !== null
+      ? Math.min(retryAfterMs, config.retry.maxDelayMs)
+      : computeDelay(attempt);
+    if (attempt < config.retry.maxRetries && RETRYABLE_STATUSES.has(status) && timeLeft(deadline) > waitMs) {
       logger.warn("http_retry", {
         status,
         attempt: attempt + 1,
@@ -122,20 +145,21 @@ const postWithRetry = async (
         honoredRetryAfter: retryAfterMs !== null,
       });
       await delay(waitMs);
-      return postWithRetry(url, body, headers, attempt + 1);
+      return postWithRetry(url, body, headers, attempt + 1, deadline);
     }
 
     return err(`HTTP ${status}`);
   } catch (e) {
-    if (attempt < config.retry.maxRetries) {
-      const waitMs = computeDelay(attempt);
+    if (timeLeft(deadline) <= 0) return err(TIME_LIMIT_ERROR);
+    const waitMs = computeDelay(attempt);
+    if (attempt < config.retry.maxRetries && timeLeft(deadline) > waitMs) {
       logger.warn("http_network_retry", {
         error: e instanceof Error ? e.message : String(e),
         attempt: attempt + 1,
         retryInMs: Math.round(waitMs),
       });
       await delay(waitMs);
-      return postWithRetry(url, body, headers, attempt + 1);
+      return postWithRetry(url, body, headers, attempt + 1, deadline);
     }
     return err(e instanceof Error ? e.message : String(e));
   }
@@ -144,7 +168,8 @@ const postWithRetry = async (
 export const httpPost = async (
   url: string,
   body: string,
-  contentType: string
+  contentType: string,
+  deadline?: Deadline
 ): Promise<Result<string>> => {
   const headers = {
     ...BROWSER_HEADERS,
@@ -152,7 +177,7 @@ export const httpPost = async (
     "User-Agent": pickUserAgent(),
   };
   const elapsed = startTimer();
-  const result = await postWithRetry(url, body, headers, 0);
+  const result = await postWithRetry(url, body, headers, 0, deadline);
   if (result.tag === "ok") {
     logger.debug("http_post_success", { url: url.split("?")[0], durationMs: elapsed() });
   }

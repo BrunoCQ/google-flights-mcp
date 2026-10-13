@@ -100,9 +100,13 @@ const formatSearchResult = (
     const flightLegs = flight.legs
       .map((l) => `  ${l.airline} ${l.flightNumber}: ${l.departureAirport} ${l.departureTime.replace("T", " ")} -> ${l.arrivalAirport} ${l.arrivalTime.replace("T", " ")}`)
       .join("\n");
-    return `Flight ${i + 1}: ${price} | ${formatDuration(flight.duration)} | ${flight.stops} stop(s)\n${flightLegs}`;
+    const label = result.partialReason ? `Leg 1 option ${i + 1}: from ${price} total itinerary` : `Flight ${i + 1}: ${price}`;
+    return `${label} | ${formatDuration(flight.duration)} | ${flight.stops} stop(s)\n${flightLegs}`;
   });
-  return `Multi-city flights: ${route}\n\n${lines.join("\n\n")}`;
+  const partialNote = result.partialReason
+    ? `\nLater legs could not be loaded (${result.partialReason}). Showing first-leg options only: each price is the cheapest TOTAL fare for an itinerary starting with that flight. Search again to see full itineraries.\n`
+    : "";
+  return `Multi-city flights: ${route}\n${partialNote}\n${lines.join("\n\n")}`;
 };
 
 export const handleSearchMultiCity = async (

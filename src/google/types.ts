@@ -114,6 +114,10 @@ export type SearchResult = {
   readonly tag: "flights";
   readonly flights: readonly FlightResult[];
   readonly metadata: SearchMetadata;
+  // Set when a round-trip/multi-city search could not load the later legs
+  // (time limit or Google errors). `flights` are then first-leg options, and
+  // each price is the cheapest TOTAL itinerary fare that starts with that flight.
+  readonly partialReason?: string;
 } | {
   readonly tag: "combos";
   readonly combos: readonly FlightCombo[];

@@ -25,6 +25,10 @@ export const config = {
     // answered in ~100ms; rejections look random, so an identical retry usually succeeds.
     maxGoogleErrorRetries: envInt("GOOGLE_ERROR_RETRY_MAX", 10),
     googleRetryMinDelayMs: envInt("GOOGLE_ERROR_RETRY_DELAY_MS", 1500),
+    // Abandon a single request that hangs longer than this and send it again.
+    // Most Google responses take 2-10s, but some long-haul searches hang for
+    // over a minute; a fresh request is usually answered quickly.
+    requestTimeoutMs: envInt("REQUEST_TIMEOUT_MS", 20_000),
   },
 
   // Circuit breaker
@@ -35,6 +39,11 @@ export const config = {
 
   // Search defaults
   search: {
+    // Hard time budget for one search tool call, including retries and the
+    // follow-up requests a round trip needs. MCP clients typically cancel a
+    // tool call after ~60s; when the budget runs out, a round-trip search
+    // returns the outbound options it already has instead of nothing.
+    deadlineMs: envInt("SEARCH_DEADLINE_MS", 45_000),
     defaultMaxResults: envInt("DEFAULT_MAX_RESULTS", 5),
     defaultCabinClass: envString("DEFAULT_CABIN_CLASS", "economy"),
     priceInsightsMaxDays: envInt("PRICE_INSIGHTS_MAX_DAYS", 30),

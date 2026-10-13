@@ -61,13 +61,14 @@ const formatFlightResult = (flight: FlightResult, index: number): string => {
   return `Flight ${index + 1}: ${price} | ${formatDuration(flight.duration)} | ${flight.stops} stop(s)${emissions}\n${legs}`;
 };
 
-const formatPriceContext = (ctx: PriceContext): string => {
+const formatPriceContext = (ctx: PriceContext, currency: string | null): string => {
+  const fmt = (n: number) => formatPrice(n, currency);
   const diff = ctx.priceDifference < 0
-    ? `$${Math.abs(ctx.priceDifference)} below typical`
+    ? `${fmt(Math.abs(ctx.priceDifference))} below typical`
     : ctx.priceDifference > 0
-      ? `$${ctx.priceDifference} above typical`
+      ? `${fmt(ctx.priceDifference)} above typical`
       : "at typical price";
-  return `Price assessment: ${ctx.assessment.toUpperCase()} (${diff}). Range: $${ctx.lowPrice} - $${ctx.highPrice}, typical: $${ctx.typicalPrice}`;
+  return `Price assessment: ${ctx.assessment.toUpperCase()} (${diff}). Range: ${fmt(ctx.lowPrice)} - ${fmt(ctx.highPrice)}, typical: ${fmt(ctx.typicalPrice)}`;
 };
 
 const buildFilters = (
@@ -94,7 +95,9 @@ const buildFilters = (
 
 const formatSearchResult = (result: SearchResult, params: z.infer<typeof searchFlightsSchema>): string => {
   const max = params.maxResults ?? 5;
-  const priceCtx = result.metadata.priceContext ? `\n${formatPriceContext(result.metadata.priceContext)}\n` : "";
+  const currency =
+    result.tag === "combos" ? result.combos[0]?.[0]?.currency ?? null : result.flights[0]?.currency ?? null;
+  const priceCtx = result.metadata.priceContext ? `\n${formatPriceContext(result.metadata.priceContext, currency)}\n` : "";
 
   if (result.tag === "combos") {
     // Google prices each leg of a round trip with the TOTAL trip fare, and the
@@ -114,6 +117,23 @@ const formatSearchResult = (result: SearchResult, params: z.infer<typeof searchF
       return `--- Option ${i + 1}: ${total} total round trip ---\n${parts.join("\n")}`;
     });
     return `Round-trip flights: ${params.origin} <-> ${params.destination}\n${params.departureDate} - ${params.returnDate}${priceCtx}\n${lines.join("\n\n")}`;
+  }
+
+  if (result.partialReason) {
+    // Round trip where the return flights could not be loaded: the outbound
+    // options' prices are already the cheapest total round-trip fares.
+    const lines = result.flights.slice(0, max).map((flight, i) => {
+      const legs = flight.legs.map(formatLeg).join("\n");
+      return `Outbound option ${i + 1}: from ${formatPrice(flight.price, flight.currency)} total round trip | ${formatDuration(flight.duration)} | ${flight.stops} stop(s)\n${legs}`;
+    });
+    return [
+      `Round-trip flights: ${params.origin} <-> ${params.destination}`,
+      `${params.departureDate} - ${params.returnDate}${priceCtx}`,
+      `Return flights could not be loaded (${result.partialReason}).`,
+      `Showing outbound options only: each price is the cheapest TOTAL round-trip fare that starts with that outbound flight. Search again to see return flights (Google usually answers faster once a route is cached).`,
+      "",
+      lines.join("\n\n"),
+    ].join("\n");
   }
 
   const lines = result.flights.slice(0, max).map(formatFlightResult);

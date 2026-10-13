@@ -12,7 +12,7 @@ import { ok, err, type Result, flatMap } from "../lib/result.js";
 import { pipe } from "../lib/pipe.js";
 import { logger, startTimer } from "../lib/logger.js";
 import { createCircuitBreaker } from "../lib/retry.js";
-import { httpPost, googleRetryDelay } from "../lib/http.js";
+import { httpPost, delay, googleRetryDelayMs, timeLeft, isTimeLimitError, TIME_LIMIT_ERROR, type Deadline } from "../lib/http.js";
 import { config } from "../lib/config.js";
 import { createCache, get as cacheGet, set as cacheSet, buildCacheKey } from "../lib/cache.js";
 
@@ -27,37 +27,56 @@ type FetchResult = {
 const flightsCache = createCache<FetchResult>();
 const circuitBreaker = createCircuitBreaker();
 
-const fetchOnce = async (filters: FlightSearchFilters): Promise<Result<FetchResult>> => {
+// Don't start (or wait for) another attempt with less time than this left.
+const MIN_ATTEMPT_MS = 2_000;
+
+// One attempt, cut off after config.retry.requestTimeoutMs (or the overall deadline, if sooner).
+const fetchOnce = async (filters: FlightSearchFilters, deadline: Deadline): Promise<Result<FetchResult>> => {
   const body = buildRequestBody(filters);
+  const attemptDeadline = Math.min(
+    deadline ?? Number.POSITIVE_INFINITY,
+    Date.now() + config.retry.requestTimeoutMs
+  );
   const textResult = await httpPost(
     FLIGHTS_URL,
     body,
-    "application/x-www-form-urlencoded;charset=UTF-8"
+    "application/x-www-form-urlencoded;charset=UTF-8",
+    attemptDeadline
   );
   return pipe(textResult, flatMap(parseFlightsResponse));
 };
 
 // Google answers a large share of direct requests with a transient RPC error
-// (HTTP 200 + ErrorResponse code 13). Re-send the identical request after a short pause.
+// (HTTP 200 + ErrorResponse code 13), and occasionally lets a request hang for
+// over a minute. Both are retried: re-send the identical request after a short
+// pause, as long as the overall deadline leaves room for another attempt.
 const fetchWithGoogleRetry = async (
   filters: FlightSearchFilters,
+  deadline: Deadline,
   attempt: number = 0
 ): Promise<Result<FetchResult>> => {
-  const result = await fetchOnce(filters);
+  const result = await fetchOnce(filters, deadline);
+  if (result.tag === "ok") return result;
+  const slowAttempt = isTimeLimitError(result.error) && timeLeft(deadline) > MIN_ATTEMPT_MS;
   if (
-    result.tag === "ok" ||
-    !isTransientGoogleError(result.error) ||
+    !(isTransientGoogleError(result.error) || slowAttempt) ||
     attempt >= config.retry.maxGoogleErrorRetries
   ) {
     return result;
   }
+  if (slowAttempt) logger.info("slow_request_retry", { attempt: attempt + 1, timeoutMs: config.retry.requestTimeoutMs });
+  const waitMs = googleRetryDelayMs();
+  if (timeLeft(deadline) < waitMs + MIN_ATTEMPT_MS) {
+    return err(`${TIME_LIMIT_ERROR} while retrying after: ${result.error}`);
+  }
   logger.debug("google_error_retry", { attempt: attempt + 1, error: result.error });
-  await googleRetryDelay();
-  return fetchWithGoogleRetry(filters, attempt + 1);
+  await delay(waitMs);
+  return fetchWithGoogleRetry(filters, deadline, attempt + 1);
 };
 
 export const fetchFlights = async (
-  filters: FlightSearchFilters
+  filters: FlightSearchFilters,
+  deadline?: Deadline
 ): Promise<Result<FetchResult>> => {
   const cacheKey = buildCacheKey(filters);
   const cached = cacheGet(flightsCache, cacheKey);
@@ -68,7 +87,7 @@ export const fetchFlights = async (
 
   const elapsed = startTimer();
 
-  const result = await circuitBreaker.execute(() => fetchWithGoogleRetry(filters));
+  const result = await circuitBreaker.execute(() => fetchWithGoogleRetry(filters, deadline));
 
   if (result.tag === "ok") {
     cacheSet(flightsCache, cacheKey, result.value);
@@ -112,11 +131,25 @@ const prependToCombos = (
     ? next.flights.map((flight) => [selected, flight])
     : next.combos.map((combo) => [selected, ...combo]);
 
+type ComboAccumulator = {
+  readonly combos: readonly FlightCombo[];
+  readonly lastError: string | null;
+};
+
+// Builds round-trip / multi-city itineraries: fetch the options for the first
+// unselected leg, then — one candidate at a time, while the deadline allows —
+// select each of the top N and fetch what can follow it. Requests are made
+// sequentially because Google rejects bursts of parallel requests far more often.
+//
+// If no complete itinerary could be assembled (time limit, Google errors), the
+// options for this leg are returned with `partialReason` set: for the first leg
+// of a round trip their prices are already the cheapest TOTAL trip fare.
 const assembleMultiLeg = async (
   filters: FlightSearchFilters,
-  topN: number
+  topN: number,
+  deadline: Deadline
 ): Promise<Result<SearchResult>> => {
-  const fetchResult = await fetchFlights(filters);
+  const fetchResult = await fetchFlights(filters, deadline);
   if (fetchResult.tag === "err") return fetchResult;
 
   const { flights, metadata } = fetchResult.value;
@@ -129,34 +162,50 @@ const assembleMultiLeg = async (
     return ok({ tag: "flights" as const, flights, metadata });
   }
 
-  const nestedResults = await Promise.all(
-    flights.slice(0, topN).map(async (selected) => {
+  const assembled = await flights.slice(0, topN).reduce<Promise<ComboAccumulator>>(
+    async (accP, selected) => {
+      const acc = await accP;
+      if (timeLeft(deadline) < MIN_ATTEMPT_MS) {
+        return { ...acc, lastError: acc.lastError ?? TIME_LIMIT_ERROR };
+      }
       const nextFilters = withSelectedFlight(filters, selectedCount, selected);
-      const nextResult = await assembleMultiLeg(nextFilters, topN);
-      return nextResult.tag === "ok"
-        ? prependToCombos(selected, nextResult.value)
-        : ([] as readonly FlightCombo[]);
-    })
+      const nextResult = await assembleMultiLeg(nextFilters, topN, deadline);
+      if (nextResult.tag === "err") return { ...acc, lastError: nextResult.error };
+      if (nextResult.value.tag === "flights" && nextResult.value.partialReason) {
+        return { ...acc, lastError: nextResult.value.partialReason };
+      }
+      return { ...acc, combos: [...acc.combos, ...prependToCombos(selected, nextResult.value)] };
+    },
+    Promise.resolve({ combos: [], lastError: null })
   );
 
-  const combos = nestedResults.flat();
+  if (assembled.combos.length > 0) {
+    return ok({ tag: "combos" as const, combos: assembled.combos, metadata });
+  }
 
-  return combos.length > 0
-    ? ok({ tag: "combos" as const, combos, metadata })
-    : err("No flight combinations found");
+  logger.warn("multi_leg_partial", { reason: assembled.lastError });
+  return ok({
+    tag: "flights" as const,
+    flights,
+    metadata,
+    partialReason: assembled.lastError ?? "No flight combinations found",
+  });
 };
 
 export const searchFlights = async (
   filters: FlightSearchFilters,
-  topN: number = 5
+  topN: number = 5,
+  deadlineMs: number = config.search.deadlineMs
 ): Promise<Result<SearchResult>> => {
+  const deadline = Date.now() + deadlineMs;
+
   if (filters.tripType === TripType.ONE_WAY) {
-    const result = await fetchFlights(filters);
+    const result = await fetchFlights(filters, deadline);
     if (result.tag === "err") return result;
     return result.value.flights.length > 0
       ? ok({ tag: "flights" as const, flights: result.value.flights, metadata: result.value.metadata })
       : err("No flights found");
   }
 
-  return assembleMultiLeg(filters, topN);
+  return assembleMultiLeg(filters, topN, deadline);
 };
