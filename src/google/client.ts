@@ -7,12 +7,13 @@ import type {
 } from "./types.js";
 import { TripType } from "./types.js";
 import { buildRequestBody } from "./request-builder.js";
-import { parseFlightsResponse } from "./response-parser.js";
+import { parseFlightsResponse, isTransientGoogleError } from "./response-parser.js";
 import { ok, err, type Result, flatMap } from "../lib/result.js";
 import { pipe } from "../lib/pipe.js";
 import { logger, startTimer } from "../lib/logger.js";
 import { createCircuitBreaker } from "../lib/retry.js";
-import { httpPost } from "../lib/http.js";
+import { httpPost, googleRetryDelay } from "../lib/http.js";
+import { config } from "../lib/config.js";
 import { createCache, get as cacheGet, set as cacheSet, buildCacheKey } from "../lib/cache.js";
 
 const FLIGHTS_URL =
@@ -26,7 +27,36 @@ type FetchResult = {
 const flightsCache = createCache<FetchResult>();
 const circuitBreaker = createCircuitBreaker();
 
-const fetchFlights = async (
+const fetchOnce = async (filters: FlightSearchFilters): Promise<Result<FetchResult>> => {
+  const body = buildRequestBody(filters);
+  const textResult = await httpPost(
+    FLIGHTS_URL,
+    body,
+    "application/x-www-form-urlencoded;charset=UTF-8"
+  );
+  return pipe(textResult, flatMap(parseFlightsResponse));
+};
+
+// Google answers a large share of direct requests with a transient RPC error
+// (HTTP 200 + ErrorResponse code 13). Re-send the identical request after a short pause.
+const fetchWithGoogleRetry = async (
+  filters: FlightSearchFilters,
+  attempt: number = 0
+): Promise<Result<FetchResult>> => {
+  const result = await fetchOnce(filters);
+  if (
+    result.tag === "ok" ||
+    !isTransientGoogleError(result.error) ||
+    attempt >= config.retry.maxGoogleErrorRetries
+  ) {
+    return result;
+  }
+  logger.debug("google_error_retry", { attempt: attempt + 1, error: result.error });
+  await googleRetryDelay();
+  return fetchWithGoogleRetry(filters, attempt + 1);
+};
+
+export const fetchFlights = async (
   filters: FlightSearchFilters
 ): Promise<Result<FetchResult>> => {
   const cacheKey = buildCacheKey(filters);
@@ -38,15 +68,7 @@ const fetchFlights = async (
 
   const elapsed = startTimer();
 
-  const result = await circuitBreaker.execute(async () => {
-    const body = buildRequestBody(filters);
-    const textResult = await httpPost(
-      FLIGHTS_URL,
-      body,
-      "application/x-www-form-urlencoded;charset=UTF-8"
-    );
-    return pipe(textResult, flatMap(parseFlightsResponse));
-  });
+  const result = await circuitBreaker.execute(() => fetchWithGoogleRetry(filters));
 
   if (result.tag === "ok") {
     cacheSet(flightsCache, cacheKey, result.value);

@@ -49,6 +49,12 @@ const computeDelay = (attempt: number): number =>
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+// Spacing for retries after a Google RPC rejection. Rejections come back in
+// ~100ms and requests sent in quick succession are rejected far more often,
+// so wait a flat 1.5-3s (with jitter) rather than starting with a short backoff.
+export const googleRetryDelay = (): Promise<void> =>
+  delay(config.retry.googleRetryMinDelayMs + Math.random() * config.retry.googleRetryMinDelayMs);
+
 // Parse a Retry-After header value. The header may be either:
 //   - a non-negative integer number of seconds
 //   - an HTTP-date (RFC 7231)

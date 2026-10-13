@@ -43,4 +43,21 @@ describe("buildCacheKey", () => {
   it("sorts keys for consistency", () => {
     expect(buildCacheKey({ b: 2, a: 1 })).toBe(buildCacheKey({ a: 1, b: 2 }));
   });
+
+  it("sorts nested keys for consistency", () => {
+    expect(buildCacheKey({ s: [{ y: 1, x: 2 }] })).toBe(buildCacheKey({ s: [{ x: 2, y: 1 }] }));
+  });
+
+  it("distinguishes values nested inside arrays of objects", () => {
+    const search = (date: string) => ({
+      tripType: 2,
+      segments: [{ departureAirport: "GIG", arrivalAirport: "PER", travelDate: date }],
+    });
+    expect(buildCacheKey(search("2026-12-04"))).not.toBe(buildCacheKey(search("2026-12-20")));
+  });
+
+  it("distinguishes different routes", () => {
+    const search = (to: string) => ({ segments: [{ departureAirport: "GIG", arrivalAirport: to }] });
+    expect(buildCacheKey(search("PER"))).not.toBe(buildCacheKey(search("SYD")));
+  });
 });

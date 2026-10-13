@@ -302,10 +302,35 @@ const parseFlightEntry = (entry: readonly unknown[]): Result<ParsedInner> => {
   return ok({ flights, metadata: parseMetadata(inner) });
 };
 
+// Google sometimes answers HTTP 200 with an RPC-level error instead of data:
+//   ["wrb.fr", null, null, null, null, [13, null, [["type.googleapis.com/travel.frontend.flights.ErrorResponse", ...]]]]
+// Code 13 (INTERNAL) is transient: re-sending the identical request usually succeeds.
+export const GOOGLE_ERROR_PREFIX = "Google returned an error response";
+
+const ERROR_RESPONSE_TYPE = "type.googleapis.com/travel.frontend.flights.ErrorResponse";
+
+const findErrorCode = (outer: readonly unknown[]): number | null => {
+  const entry = safeArray(outer).find((e) => {
+    const status = safeArray(safeArray(e)[5]);
+    const details = safeArray(status[2]);
+    return details.some((d) => safeArray(d)[0] === ERROR_RESPONSE_TYPE);
+  });
+  if (!entry) return null;
+  return safeNumber(safeArray(safeArray(entry)[5])[0], -1);
+};
+
+export const isTransientGoogleError = (error: string): boolean =>
+  error.startsWith(GOOGLE_ERROR_PREFIX);
+
 const findAndParseFlightData = (outer: readonly unknown[]): Result<ParsedInner> => {
   const entry = findFlightEntry(outer);
 
   if (!entry) {
+    const errorCode = findErrorCode(outer);
+    if (errorCode !== null) {
+      logger.warn("google_error_response", { code: errorCode });
+      return err(`${GOOGLE_ERROR_PREFIX} (code ${errorCode})`);
+    }
     logger.warn("parse_no_flight_data", { outerLength: safeArray(outer).length });
     return err("No flight data found in response — Google may have changed the response format");
   }

@@ -97,12 +97,21 @@ const formatSearchResult = (result: SearchResult, params: z.infer<typeof searchF
   const priceCtx = result.metadata.priceContext ? `\n${formatPriceContext(result.metadata.priceContext)}\n` : "";
 
   if (result.tag === "combos") {
-    const lines = result.combos.slice(0, max).map((combo, i) => {
+    // Google prices each leg of a round trip with the TOTAL trip fare, and the
+    // final leg's price is the fare for the whole selected itinerary.
+    const comboTotal = (combo: readonly FlightResult[]): number => combo[combo.length - 1]?.price ?? 0;
+    const ordered = params.sortBy === "price"
+      ? [...result.combos].sort((a, b) => comboTotal(a) - comboTotal(b))
+      : result.combos;
+    const lines = ordered.slice(0, max).map((combo, i) => {
+      const last = combo[combo.length - 1];
+      const total = last ? formatPrice(last.price, last.currency) : "?";
       const parts = combo.map((flight, j) => {
         const label = j === 0 ? "Outbound" : "Return";
-        return `${label}:\n${formatFlightResult(flight, 0)}`;
+        const legs = flight.legs.map(formatLeg).join("\n");
+        return `${label}: ${formatDuration(flight.duration)} | ${flight.stops} stop(s)\n${legs}`;
       });
-      return `--- Option ${i + 1} ---\n${parts.join("\n")}`;
+      return `--- Option ${i + 1}: ${total} total round trip ---\n${parts.join("\n")}`;
     });
     return `Round-trip flights: ${params.origin} <-> ${params.destination}\n${params.departureDate} - ${params.returnDate}${priceCtx}\n${lines.join("\n\n")}`;
   }

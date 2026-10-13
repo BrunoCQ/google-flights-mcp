@@ -77,18 +77,20 @@ const formatSearchResult = (
     .join(" | ");
 
   if (result.tag === "combos") {
+    // Each leg carries the fare for the whole itinerary; the last leg's price is the total.
     const lines = result.combos.slice(0, max).map((combo, i) => {
+      const last = combo[combo.length - 1];
+      const total = last ? formatPrice(last.price, last.currency) : "?";
       const legs = combo
         .map((flight, j) => {
           const seg = params.segments[j];
-          const price = formatPrice(flight.price, flight.currency);
           const flightLegs = flight.legs
-            .map((l) => `    ${l.airline} ${l.flightNumber}: ${l.departureAirport} -> ${l.arrivalAirport}`)
+            .map((l) => `    ${l.airline} ${l.flightNumber}: ${l.departureAirport} ${l.departureTime.replace("T", " ")} -> ${l.arrivalAirport} ${l.arrivalTime.replace("T", " ")}`)
             .join("\n");
-          return `  Leg ${j + 1} (${seg?.origin}->${seg?.destination}): ${price} | ${formatDuration(flight.duration)}\n${flightLegs}`;
+          return `  Leg ${j + 1} (${seg?.origin}->${seg?.destination}): ${formatDuration(flight.duration)} | ${flight.stops} stop(s)\n${flightLegs}`;
         })
         .join("\n");
-      return `--- Option ${i + 1} ---\n${legs}`;
+      return `--- Option ${i + 1}: ${total} total ---\n${legs}`;
     });
     return `Multi-city flights: ${route}\n\n${lines.join("\n\n")}`;
   }

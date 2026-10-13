@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseFlightsResponse } from "../src/google/response-parser.js";
+import { parseFlightsResponse, isTransientGoogleError } from "../src/google/response-parser.js";
 
 // Minimal valid Google Flights response structure
 const makeResponse = (flights: unknown[][] = []) => {
@@ -137,5 +137,31 @@ describe("parseFlightsResponse", () => {
     expect(result.value.flights[0].legs).toHaveLength(2);
     expect(result.value.flights[0].legs[0].arrivalAirport).toBe("DEN");
     expect(result.value.flights[0].legs[1].departureAirport).toBe("DEN");
+  });
+});
+
+describe("parseFlightsResponse — Google RPC error responses", () => {
+  // Real shape captured from Google: HTTP 200 with an ErrorResponse (code 13) instead of data
+  const errorResponse =
+    ")]}'\n\n" +
+    JSON.stringify([
+      ["wrb.fr", null, null, null, null, [13, null, [["type.googleapis.com/travel.frontend.flights.ErrorResponse", [[null, [[1, 2, 3], null, null, null, null, [[0]]], 0, "a", "b"], 0]]]]],
+      ["di", 59],
+      ["af.httprm", 59, "-1", 0],
+    ]);
+
+  it("reports the error code and flags it as transient", () => {
+    const result = parseFlightsResponse(errorResponse);
+    expect(result.tag).toBe("err");
+    if (result.tag !== "err") return;
+    expect(result.error).toContain("code 13");
+    expect(isTransientGoogleError(result.error)).toBe(true);
+  });
+
+  it("does not flag genuine format changes as transient", () => {
+    const result = parseFlightsResponse(")]}'\n\n" + JSON.stringify([["wrb.fr", null, null]]));
+    expect(result.tag).toBe("err");
+    if (result.tag !== "err") return;
+    expect(isTransientGoogleError(result.error)).toBe(false);
   });
 });

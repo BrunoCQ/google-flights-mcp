@@ -48,7 +48,26 @@ export const set = <T>(
   cache.set(key, { value, expiresAt: Date.now() + ttlMs });
 };
 
+// Deterministic, deep serialization: object keys are sorted at EVERY level.
+// (Passing a key array as JSON.stringify's replacer — the previous approach —
+// acts as an allow-list applied to nested objects too, which silently dropped
+// every nested field such as segments[].travelDate, so searches on different
+// dates or routes collided on the same cache entry.)
+const stableSerialize = (value: unknown): string => {
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => (v === undefined ? "null" : stableSerialize(v))).join(",")}]`;
+  }
+  if (typeof value === "object" && value !== null) {
+    const record = value as Record<string, unknown>;
+    const body = Object.keys(record)
+      .filter((k) => record[k] !== undefined)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${stableSerialize(record[k])}`)
+      .join(",");
+    return `{${body}}`;
+  }
+  return JSON.stringify(value) ?? String(value);
+};
+
 export const buildCacheKey = (obj: unknown): string =>
-  typeof obj === "object" && obj !== null
-    ? JSON.stringify(obj, Object.keys(obj as Record<string, unknown>).sort())
-    : String(obj);
+  typeof obj === "object" && obj !== null ? stableSerialize(obj) : String(obj);

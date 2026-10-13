@@ -21,6 +21,10 @@ export const config = {
     maxRetries: envInt("RETRY_MAX", 2),
     baseDelayMs: envInt("RETRY_BASE_DELAY_MS", 500),
     maxDelayMs: envInt("RETRY_MAX_DELAY_MS", 5000),
+    // Google intermittently rejects ~half of direct requests with an RPC error (code 13),
+    // answered in ~100ms; rejections look random, so an identical retry usually succeeds.
+    maxGoogleErrorRetries: envInt("GOOGLE_ERROR_RETRY_MAX", 10),
+    googleRetryMinDelayMs: envInt("GOOGLE_ERROR_RETRY_DELAY_MS", 1500),
   },
 
   // Circuit breaker
