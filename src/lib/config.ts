@@ -26,9 +26,10 @@ export const config = {
     maxGoogleErrorRetries: envInt("GOOGLE_ERROR_RETRY_MAX", 10),
     googleRetryMinDelayMs: envInt("GOOGLE_ERROR_RETRY_DELAY_MS", 1500),
     // Abandon a single request that hangs longer than this and send it again.
-    // Most Google responses take 2-10s, but some long-haul searches hang for
-    // over a minute; a fresh request is usually answered quickly.
-    requestTimeoutMs: envInt("REQUEST_TIMEOUT_MS", 20_000),
+    // Most Google responses take 2-10s, but uncached long-haul searches can
+    // legitimately take 30-90s (and a re-sent request is not faster), so this
+    // only guards against requests that never complete.
+    requestTimeoutMs: envInt("REQUEST_TIMEOUT_MS", 120_000),
   },
 
   // Circuit breaker
@@ -44,6 +45,9 @@ export const config = {
     // tool call after ~60s; when the budget runs out, a round-trip search
     // returns the outbound options it already has instead of nothing.
     deadlineMs: envInt("SEARCH_DEADLINE_MS", 45_000),
+    // How long a search may keep running after the tool call has returned.
+    // Its result is cached, so the same search a little later answers instantly.
+    backgroundMs: envInt("SEARCH_BACKGROUND_MS", 180_000),
     defaultMaxResults: envInt("DEFAULT_MAX_RESULTS", 5),
     defaultCabinClass: envString("DEFAULT_CABIN_CLASS", "economy"),
     priceInsightsMaxDays: envInt("PRICE_INSIGHTS_MAX_DAYS", 30),

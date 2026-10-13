@@ -74,6 +74,52 @@ const fetchWithGoogleRetry = async (
   return fetchWithGoogleRetry(filters, deadline, attempt + 1);
 };
 
+// Searches that are still running, keyed like the cache. A tool call that runs
+// out of time leaves its search running here; when it finishes, the result is
+// cached, so asking again shortly afterwards answers instantly. Identical
+// concurrent searches share one request.
+/* eslint-disable functional/immutable-data -- mutation confined to this registry */
+const inflight = new Map<string, Promise<Result<FetchResult>>>();
+
+export const STILL_RUNNING_NOTE =
+  "still searching in the background; Google can take over a minute to compute long-haul searches. " +
+  "Run the same search again in about a minute and it will answer from cache.";
+
+const startSearch = (filters: FlightSearchFilters, cacheKey: string): Promise<Result<FetchResult>> => {
+  const existing = inflight.get(cacheKey);
+  if (existing) return existing;
+
+  const elapsed = startTimer();
+  const backgroundDeadline = Date.now() + config.search.backgroundMs;
+  const search = circuitBreaker
+    .execute(() => fetchWithGoogleRetry(filters, backgroundDeadline))
+    .then((result) => {
+      inflight.delete(cacheKey);
+      if (result.tag === "ok") {
+        cacheSet(flightsCache, cacheKey, result.value);
+        logger.info("search_complete", {
+          origin: filters.segments[0]?.departureAirport,
+          destination: filters.segments[0]?.arrivalAirport,
+          results: result.value.flights.length,
+          durationMs: elapsed(),
+        });
+      } else {
+        logger.error("search_failed", {
+          origin: filters.segments[0]?.departureAirport,
+          destination: filters.segments[0]?.arrivalAirport,
+          error: result.error,
+          durationMs: elapsed(),
+        });
+      }
+      return result;
+    });
+  inflight.set(cacheKey, search);
+  return search;
+};
+/* eslint-enable functional/immutable-data */
+
+// Returns the cached result, or waits for the (possibly shared) search until
+// the caller's deadline. Past the deadline the search keeps running.
 export const fetchFlights = async (
   filters: FlightSearchFilters,
   deadline?: Deadline
@@ -85,27 +131,20 @@ export const fetchFlights = async (
     return ok(cached);
   }
 
-  const elapsed = startTimer();
+  const search = startSearch(filters, cacheKey);
+  const remaining = timeLeft(deadline);
+  if (!Number.isFinite(remaining)) return search;
 
-  const result = await circuitBreaker.execute(() => fetchWithGoogleRetry(filters, deadline));
-
-  if (result.tag === "ok") {
-    cacheSet(flightsCache, cacheKey, result.value);
-    logger.info("search_complete", {
+  const timedOut: Promise<Result<FetchResult>> = delay(Math.max(0, remaining)).then(() =>
+    err(`${TIME_LIMIT_ERROR}: ${STILL_RUNNING_NOTE}`)
+  );
+  const result = await Promise.race([search, timedOut]);
+  if (result.tag === "err" && isTimeLimitError(result.error)) {
+    logger.info("search_continues_in_background", {
       origin: filters.segments[0]?.departureAirport,
       destination: filters.segments[0]?.arrivalAirport,
-      results: result.value.flights.length,
-      durationMs: elapsed(),
-    });
-  } else {
-    logger.error("search_failed", {
-      origin: filters.segments[0]?.departureAirport,
-      destination: filters.segments[0]?.arrivalAirport,
-      error: result.error,
-      durationMs: elapsed(),
     });
   }
-
   return result;
 };
 
@@ -165,8 +204,10 @@ const assembleMultiLeg = async (
   const assembled = await flights.slice(0, topN).reduce<Promise<ComboAccumulator>>(
     async (accP, selected) => {
       const acc = await accP;
-      if (timeLeft(deadline) < MIN_ATTEMPT_MS) {
-        return { ...acc, lastError: acc.lastError ?? TIME_LIMIT_ERROR };
+      // Start the next lookup while any time is left: even if it can't finish
+      // in time, it keeps running in the background and warms the cache.
+      if (timeLeft(deadline) <= 0) {
+        return { ...acc, lastError: acc.lastError ?? `${TIME_LIMIT_ERROR}: ${STILL_RUNNING_NOTE}` };
       }
       const nextFilters = withSelectedFlight(filters, selectedCount, selected);
       const nextResult = await assembleMultiLeg(nextFilters, topN, deadline);

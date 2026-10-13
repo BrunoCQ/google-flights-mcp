@@ -104,13 +104,42 @@ describe("searchFlights — round trips", () => {
     expect(result.value.partialReason).toBeTruthy();
   });
 
-  it("stops retrying when the overall deadline leaves no room", async () => {
-    mockedPost.mockResolvedValue(ok(errorResponse));
+  it("returns at the deadline while a slow search is still running", async () => {
+    mockedPost.mockImplementation(() => new Promise((r) => setTimeout(() => r(ok(outbound)), 1000)));
     const started = Date.now();
-    const result = await searchFlights(roundTrip(), 1, 300);
+    const result = await searchFlights(roundTrip(), 1, 200);
     expect(result.tag).toBe("err");
     if (result.tag !== "err") return;
     expect(result.error).toContain(TIME_LIMIT_ERROR);
-    expect(Date.now() - started).toBeLessThan(2000);
+    expect(result.error).toContain("background");
+    expect(Date.now() - started).toBeLessThan(600);
+  });
+
+  it("finishes a timed-out search in the background so the next call answers from cache", async () => {
+    const filters = roundTrip();
+    mockedPost
+      .mockImplementationOnce(() => new Promise((r) => setTimeout(() => r(ok(outbound)), 300)))
+      .mockResolvedValueOnce(ok(inbound));
+
+    const first = await searchFlights(filters, 1, 100);
+    expect(first.tag).toBe("err");
+
+    await new Promise((r) => setTimeout(r, 400)); // background search completes and is cached
+
+    const second = await searchFlights(filters, 1, 1000);
+    expect(second.tag === "ok" && second.value.tag).toBe("combos");
+    // one outbound request (finished in the background) + one return request
+    expect(mockedPost).toHaveBeenCalledTimes(2);
+  });
+
+  it("shares one request between identical concurrent searches", async () => {
+    const filters = roundTrip();
+    mockedPost
+      .mockImplementationOnce(() => new Promise((r) => setTimeout(() => r(ok(outbound)), 100)))
+      .mockResolvedValue(ok(inbound));
+    const [a, b] = await Promise.all([searchFlights(filters, 1, 2000), searchFlights(filters, 1, 2000)]);
+    expect(a.tag === "ok" && a.value.tag).toBe("combos");
+    expect(b.tag === "ok" && b.value.tag).toBe("combos");
+    expect(mockedPost).toHaveBeenCalledTimes(2);
   });
 });
