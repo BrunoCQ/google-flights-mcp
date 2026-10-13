@@ -30,6 +30,8 @@ export const config = {
     // legitimately take 30-90s (and a re-sent request is not faster), so this
     // only guards against requests that never complete.
     requestTimeoutMs: envInt("REQUEST_TIMEOUT_MS", 120_000),
+    // At most this many requests to Google at once; the rest wait their turn.
+    maxConcurrentRequests: envInt("MAX_CONCURRENT_REQUESTS", 2),
   },
 
   // Circuit breaker

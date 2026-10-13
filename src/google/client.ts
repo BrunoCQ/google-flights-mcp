@@ -14,6 +14,7 @@ import { logger, startTimer } from "../lib/logger.js";
 import { createCircuitBreaker } from "../lib/retry.js";
 import { httpPost, delay, googleRetryDelayMs, timeLeft, isTimeLimitError, TIME_LIMIT_ERROR, type Deadline } from "../lib/http.js";
 import { config } from "../lib/config.js";
+import { withRequestSlot } from "../lib/limiter.js";
 import { createCache, get as cacheGet, set as cacheSet, buildCacheKey } from "../lib/cache.js";
 
 const FLIGHTS_URL =
@@ -30,18 +31,18 @@ const circuitBreaker = createCircuitBreaker();
 // Don't start (or wait for) another attempt with less time than this left.
 const MIN_ATTEMPT_MS = 2_000;
 
-// One attempt, cut off after config.retry.requestTimeoutMs (or the overall deadline, if sooner).
+// One attempt, cut off after config.retry.requestTimeoutMs (or the overall
+// deadline, if sooner). Waits for a free request slot first (see limiter.ts);
+// the per-attempt timeout starts once the request is actually sent.
 const fetchOnce = async (filters: FlightSearchFilters, deadline: Deadline): Promise<Result<FetchResult>> => {
   const body = buildRequestBody(filters);
-  const attemptDeadline = Math.min(
-    deadline ?? Number.POSITIVE_INFINITY,
-    Date.now() + config.retry.requestTimeoutMs
-  );
-  const textResult = await httpPost(
-    FLIGHTS_URL,
-    body,
-    "application/x-www-form-urlencoded;charset=UTF-8",
-    attemptDeadline
+  const textResult = await withRequestSlot(() =>
+    httpPost(
+      FLIGHTS_URL,
+      body,
+      "application/x-www-form-urlencoded;charset=UTF-8",
+      Math.min(deadline ?? Number.POSITIVE_INFINITY, Date.now() + config.retry.requestTimeoutMs)
+    )
   );
   return pipe(textResult, flatMap(parseFlightsResponse));
 };
