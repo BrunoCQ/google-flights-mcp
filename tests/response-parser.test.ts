@@ -158,6 +158,24 @@ describe("parseFlightsResponse — Google RPC error responses", () => {
     expect(isTransientGoogleError(result.error)).toBe(true);
   });
 
+  it("recognizes the bare status form Google started sending (real capture, 2026-10-14)", () => {
+    const raw = ")]}'\n\n" + '[["wrb.fr",null,null,null,null,[13]],["di",27],["af.httprm",26,"875953091374509568",55]]';
+    const result = parseFlightsResponse(raw);
+    expect(result.tag).toBe("err");
+    if (result.tag !== "err") return;
+    expect(result.error).toContain("code 13");
+    expect(isTransientGoogleError(result.error)).toBe(true);
+  });
+
+  it("reports non-transient status codes without retrying them", () => {
+    const raw = ")]}'\n\n" + JSON.stringify([["wrb.fr", null, null, null, null, [3]]]);
+    const result = parseFlightsResponse(raw);
+    expect(result.tag).toBe("err");
+    if (result.tag !== "err") return;
+    expect(result.error).toContain("status code 3");
+    expect(isTransientGoogleError(result.error)).toBe(false);
+  });
+
   it("does not flag genuine format changes as transient", () => {
     const result = parseFlightsResponse(")]}'\n\n" + JSON.stringify([["wrb.fr", null, null]]));
     expect(result.tag).toBe("err");
